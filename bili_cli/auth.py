@@ -1,9 +1,12 @@
 """Authentication for Bilibili.
 
 Strategy:
-1. Try loading saved credential from ~/.bilibili-cli/credential.json
-2. Try extracting cookies from local browsers via browser-cookie3
-3. Fallback: QR code login via bilibili-api-python + terminal display
+1. Load the saved credential from ~/.bilibili-cli/credential.json
+2. Otherwise the user logs in with `bili login` (QR code in the terminal)
+
+Browser cookie extraction was removed on purpose: reading Chrome's cookie
+store needs the "Chrome Safe Storage" Keychain key, which decrypts every
+site's cookies, not just Bilibili's.
 """
 
 from __future__ import annotations
@@ -12,14 +15,14 @@ import asyncio
 import json
 import logging
 import shutil
-import subprocess
 import sys
+from urllib.parse import parse_qs, urlparse
 import time
 from pathlib import Path
 from typing import Literal
 
+import aiohttp
 import qrcode
-from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 from bilibili_api.utils.network import Credential
 
 logger = logging.getLogger(__name__)
@@ -44,62 +47,32 @@ AuthMode = Literal["optional", "read", "write"]
 def get_credential(mode: AuthMode = "read") -> Credential | None:
     """Try auth methods in order and return credential according to mode.
 
-    - optional: only load saved credential (no network validation, no browser scan)
+    - optional: only load saved credential (no network validation)
     - read: prefer validated credential; if validation is indeterminate (network),
-      return saved/browser credential as best effort
+      return the saved credential as best effort
     - write: same as read, but require bili_jct capability
     """
     require_write = mode == "write"
 
-    # 1. Saved credential file
     cred = _load_saved_credential()
-    if cred:
-        # Check TTL — try to refresh from browser if stale
-        if _is_credential_stale():
-            logger.info("Credential older than %d days, attempting browser refresh", CREDENTIAL_TTL_DAYS)
-            fresh = _extract_browser_credential()
-            if fresh:
-                validation = _validate_credential(fresh, require_write=require_write)
-                if validation is True:
-                    logger.info("Refreshed credential from browser")
-                    save_credential(fresh)
-                    return fresh
-            # Refresh failed — validate existing credential
-            logger.warning(
-                "Credential is %d+ days old; browser refresh failed. Validating existing credential...",
-                CREDENTIAL_TTL_DAYS,
-            )
-
-        if mode == "optional":
-            return cred
-        validation = _validate_credential(cred, require_write=require_write)
-        if validation is True:
-            logger.info("Loaded valid credential from %s", CREDENTIAL_FILE)
-            return cred
-        if validation is None:
-            logger.warning("Credential validation failed due to network; using saved credential as best effort")
-            return cred
-        if validation is False:
-            logger.warning("Saved credential is expired, clearing")
-            clear_credential()
-
-    if mode == "optional":
+    if cred is None:
         return None
+    if mode == "optional":
+        return cred
 
-    # 2. Browser cookie extraction
-    cred = _extract_browser_credential()
-    if cred:
-        validation = _validate_credential(cred, require_write=require_write)
-        if validation is True:
-            logger.info("Extracted valid credential from local browser")
-            save_credential(cred)
-            return cred
-        if validation is None:
-            logger.warning("Skipping browser credential validation due to network; using best effort")
-            return cred
-        if validation is False:
-            logger.warning("Browser cookies are expired/invalid")
+    if _is_credential_stale():
+        logger.info("Credential older than %d days; validating it", CREDENTIAL_TTL_DAYS)
 
+    validation = _validate_credential(cred, require_write=require_write)
+    if validation is True:
+        logger.info("Loaded valid credential from %s", CREDENTIAL_FILE)
+        return cred
+    if validation is None:
+        logger.warning("Credential validation failed due to network; using saved credential as best effort")
+        return cred
+    logger.warning("Saved credential is expired or lacks write access; run `bili login`")
+    if not require_write:
+        clear_credential()
     return None
 
 
@@ -169,95 +142,6 @@ def _load_saved_credential() -> Credential | None:
         )
     except (json.JSONDecodeError, KeyError) as e:
         logger.warning("Failed to load saved credential: %s", e)
-        return None
-
-
-def _extract_browser_credential() -> Credential | None:
-    """Extract Bilibili cookies from local browsers using browser-cookie3.
-
-    Runs extraction in a subprocess with timeout to avoid hanging
-    when the browser is running (Chrome DB lock issue).
-    """
-    extract_script = '''
-import json, sys
-try:
-    import browser_cookie3 as bc3
-except ImportError:
-    print(json.dumps({"error": "not_installed"}))
-    sys.exit(0)
-
-browsers = [
-    ("Chrome", bc3.chrome),
-    ("Firefox", bc3.firefox),
-    ("Edge", bc3.edge),
-    ("Brave", bc3.brave),
-]
-
-for name, loader in browsers:
-    try:
-        cj = loader(domain_name=".bilibili.com")
-        cookies = {c.name: c.value for c in cj if "bilibili.com" in (c.domain or "")}
-        if "SESSDATA" in cookies:
-            print(json.dumps({"browser": name, "cookies": cookies}))
-            sys.exit(0)
-    except Exception:
-        pass
-
-print(json.dumps({"error": "no_cookies"}))
-'''
-
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", extract_script],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-
-        if result.returncode != 0:
-            logger.debug("Cookie extraction subprocess failed: %s", result.stderr)
-            return None
-
-        output = result.stdout.strip()
-        if not output:
-            logger.debug("Cookie extraction returned empty output")
-            return None
-
-        data = json.loads(output)
-
-        if "error" in data:
-            if data["error"] == "not_installed":
-                logger.debug("browser-cookie3 not installed, skipping")
-            else:
-                logger.debug("No valid Bilibili cookies found in any browser")
-            return None
-
-        cookies = data["cookies"]
-        browser_name = data["browser"]
-        if not REQUIRED_COOKIES.issubset(cookies):
-            logger.debug("Browser cookies missing required keys: %s", REQUIRED_COOKIES)
-            return None
-        logger.info(
-            "Found valid cookies in %s (%d cookies)", browser_name, len(cookies)
-        )
-
-        return Credential(
-            sessdata=cookies.get("SESSDATA", ""),
-            bili_jct=cookies.get("bili_jct", ""),
-            ac_time_value=cookies.get("ac_time_value", ""),
-            buvid3=cookies.get("buvid3", ""),
-            buvid4=cookies.get("buvid4", ""),
-            dedeuserid=cookies.get("DedeUserID", ""),
-        )
-
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "Cookie extraction timed out (browser may be running). "
-            "Try closing your browser or use `bili login`."
-        )
-        return None
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning("Cookie extraction parse error: %s", e)
         return None
 
 
@@ -356,23 +240,77 @@ def _render_compact_qr(data: str) -> str | None:
     return "\n".join(lines)
 
 
-def _get_qr_terminal_output(login: QrCodeLogin) -> str:
-    """Choose compact QR rendering when possible, otherwise use default output."""
-    default_qr = login.get_qrcode_terminal()
+def _render_ascii_qr(data: str) -> str:
+    """Plain ASCII QR code, used when Unicode half blocks are unavailable."""
+    import io
 
-    qr_link = getattr(login, "_QrCodeLogin__qr_link", None)
-    if not qr_link:
-        logger.warning("QR link unavailable from QrCodeLogin internals, using default renderer")
-        return default_qr
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(data)
+    qr.make(fit=True)
+    buf = io.StringIO()
+    qr.print_ascii(out=buf, invert=True)
+    return buf.getvalue()
 
+
+def _get_qr_terminal_output(qr_link: str) -> str:
+    """Choose compact QR rendering when possible, otherwise use ASCII output."""
     if not _supports_unicode_half_blocks():
-        logger.warning("stdout encoding cannot render Unicode QR blocks, using default renderer")
-        return default_qr
+        logger.warning("stdout encoding cannot render Unicode QR blocks, using ASCII renderer")
+        return _render_ascii_qr(qr_link)
 
     compact_qr = _render_compact_qr(qr_link)
     if compact_qr is None:
-        return default_qr
+        return _render_ascii_qr(qr_link)
     return compact_qr
+
+
+_QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+_LOGIN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+}
+
+# Poll codes from passport.bilibili.com
+_QR_DONE = 0
+_QR_EXPIRED = 86038
+_QR_SCANNED = 86090
+_QR_WAITING = 86101
+
+
+def _credential_from_login(cookies: dict[str, str], login_url: str, refresh_token: str) -> Credential:
+    """Build a credential from the poll response's Set-Cookie headers.
+
+    Bilibili used to put the cookies in the returned URL's query string as
+    well; read it as a fallback for any cookie the headers did not carry.
+    """
+    query = {k: v[0] for k, v in parse_qs(urlparse(login_url).query).items() if v} if login_url else {}
+
+    def pick(name: str) -> str:
+        return cookies.get(name) or query.get(name) or ""
+
+    return Credential(
+        sessdata=pick("SESSDATA"),
+        bili_jct=pick("bili_jct"),
+        dedeuserid=pick("DedeUserID"),
+        ac_time_value=refresh_token or "",
+        buvid3=cookies.get("buvid3", ""),
+        buvid4=cookies.get("buvid4", ""),
+    )
+
+
+async def _fetch_buvid(session: aiohttp.ClientSession) -> dict[str, str]:
+    """Device cookies that make Bilibili's 412 anti-bot checks less likely."""
+    try:
+        async with session.get(_SPI_URL) as resp:
+            data = (await resp.json(content_type=None)).get("data") or {}
+        return {k: v for k, v in (("buvid3", data.get("b_3", "")), ("buvid4", data.get("b_4", ""))) if v}
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return {}
 
 
 async def qr_login() -> Credential:
@@ -381,28 +319,42 @@ async def qr_login() -> Credential:
     Displays a QR code in the terminal, polls until login completes,
     then saves and returns the credential.
     """
-    login = QrCodeLogin()
-    await login.generate_qrcode()
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(headers=_LOGIN_HEADERS, timeout=timeout) as session:
+        async with session.get(_QR_GENERATE_URL) as resp:
+            resp.raise_for_status()
+            gen = (await resp.json(content_type=None)).get("data") or {}
+        qr_link, qr_key = gen.get("url"), gen.get("qrcode_key")
+        if not qr_link or not qr_key:
+            raise RuntimeError("生成二维码失败")
 
-    # Display QR code in terminal
-    print("\n📱 请使用 Bilibili App 扫描以下二维码登录:\n")
-    print(_get_qr_terminal_output(login))
-    print("\n⭐ 扫码后请在手机上确认登录...")
+        print("\n📱 请使用 Bilibili App 扫描以下二维码登录:\n")
+        print(_get_qr_terminal_output(qr_link))
+        print("\n⭐ 扫码后请在手机上确认登录...")
 
-    # Poll login state
-    while True:
-        state = await login.check_state()
+        announced_scan = False
+        while True:
+            async with session.get(_QR_POLL_URL, params={"qrcode_key": qr_key}) as resp:
+                resp.raise_for_status()
+                data = (await resp.json(content_type=None)).get("data") or {}
+                set_cookies = {name: morsel.value for name, morsel in resp.cookies.items()}
 
-        if state == QrCodeLoginEvents.DONE:
-            credential = login.get_credential()
-            save_credential(credential)
-            print("\n✅ 登录成功！凭证已保存")
-            return credential
+            code = data.get("code")
+            if code == _QR_DONE:
+                jar = {c.key: c.value for c in session.cookie_jar}
+                cookies = {**jar, **set_cookies, **await _fetch_buvid(session)}
+                credential = _credential_from_login(cookies, data.get("url", ""), data.get("refresh_token", ""))
+                if not credential.sessdata:
+                    raise RuntimeError("登录已确认，但 Bilibili 未返回 SESSDATA，凭证未保存")
+                save_credential(credential)
+                print("\n✅ 登录成功！凭证已保存")
+                return credential
+            if code == _QR_EXPIRED:
+                raise RuntimeError("二维码已过期，请重试")
+            if code == _QR_SCANNED and not announced_scan:
+                print("  📲 已扫码，请在手机上确认...")
+                announced_scan = True
+            elif code not in (_QR_WAITING, _QR_SCANNED):
+                raise RuntimeError(f"登录失败: {data.get('message') or code}")
 
-        elif state == QrCodeLoginEvents.TIMEOUT:
-            raise RuntimeError("二维码已过期，请重试")
-
-        elif state == QrCodeLoginEvents.CONF:
-            print("  📲 已扫码，请在手机上确认...")
-
-        await asyncio.sleep(2)
+            await asyncio.sleep(2)

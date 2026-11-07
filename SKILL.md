@@ -52,7 +52,7 @@ bili status                    # Check if logged in (exit 0 = yes, 1 = no)
 bili login                     # QR code login (if not authenticated)
 ```
 
-Authentication auto-detects local browser cookies (Chrome/Firefox/Edge/Brave). If cookies are found and valid, no manual login needed. Credentials are saved to `~/.bilibili-cli/credential.json`.
+Log in once with `bili login` (QR code). Credentials are saved to `~/.bilibili-cli/credential.json` (owner-only). The CLI never reads browser cookies, so it never asks for Keychain access.
 
 ## Command Reference
 
@@ -248,5 +248,5 @@ bili video BV1xxx --ai --comments
 ## Safety Notes
 
 - Do not ask users to share raw credential/cookie values in chat logs.
-- Prefer local browser cookie extraction over manual secret copy/paste.
+- Never extract cookies from the user's browser; use `bili login`.
 - If auth fails, ask the user to re-login via `bili login`.

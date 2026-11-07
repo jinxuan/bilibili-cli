@@ -1,7 +1,7 @@
 """Tests for auth module."""
 
 import json
-import subprocess
+import pathlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -9,7 +9,7 @@ from bilibili_api.exceptions import NetworkException
 from bilibili_api.utils.network import Credential
 
 from bili_cli.auth import (
-    _extract_browser_credential,
+    _credential_from_login,
     _get_qr_terminal_output,
     _load_saved_credential,
     _render_compact_qr,
@@ -115,86 +115,37 @@ def test_validate_credential_requires_bili_jct_for_write():
 def test_get_credential_uses_saved_when_valid():
     saved = Credential(sessdata="saved", bili_jct="jct")
     with patch("bili_cli.auth._load_saved_credential", return_value=saved), \
-         patch("bili_cli.auth._validate_credential", return_value=True) as mock_validate, \
-         patch("bili_cli.auth._extract_browser_credential") as mock_extract:
+         patch("bili_cli.auth._validate_credential", return_value=True) as mock_validate:
         cred = get_credential()
         assert cred is saved
         mock_validate.assert_called_once_with(saved, require_write=False)
-        mock_extract.assert_not_called()
-
-
-def test_get_credential_falls_back_to_browser_and_saves():
-    browser = Credential(sessdata="browser", bili_jct="jct")
-    with patch("bili_cli.auth._load_saved_credential", return_value=None), \
-         patch("bili_cli.auth._extract_browser_credential", return_value=browser), \
-         patch("bili_cli.auth._validate_credential", return_value=True), \
-         patch("bili_cli.auth.save_credential") as mock_save:
-        cred = get_credential()
-        assert cred is browser
-        mock_save.assert_called_once_with(browser)
 
 
 def test_get_credential_keeps_saved_on_validation_network_error():
     saved = Credential(sessdata="saved", bili_jct="jct")
     with patch("bili_cli.auth._load_saved_credential", return_value=saved), \
          patch("bili_cli.auth._validate_credential", return_value=None), \
-         patch("bili_cli.auth.clear_credential") as mock_clear, \
-         patch("bili_cli.auth._extract_browser_credential") as mock_extract:
+         patch("bili_cli.auth.clear_credential") as mock_clear:
         cred = get_credential()
         assert cred is saved
         mock_clear.assert_not_called()
-        mock_extract.assert_not_called()
-
-
-def test_get_credential_clears_expired_saved_and_returns_none_when_browser_invalid():
-    saved = Credential(sessdata="saved", bili_jct="jct")
-    browser = Credential(sessdata="browser", bili_jct="jct")
-    with patch("bili_cli.auth._load_saved_credential", return_value=saved), \
-         patch("bili_cli.auth._extract_browser_credential", return_value=browser), \
-         patch("bili_cli.auth._validate_credential", side_effect=[False, False]), \
-         patch("bili_cli.auth.clear_credential") as mock_clear, \
-         patch("bili_cli.auth.save_credential") as mock_save:
-        cred = get_credential()
-        assert cred is None
-        mock_clear.assert_called_once()
-        mock_save.assert_not_called()
 
 
 def test_get_credential_optional_uses_saved_without_validation():
     saved = Credential(sessdata="saved", bili_jct="jct")
     with patch("bili_cli.auth._load_saved_credential", return_value=saved), \
-         patch("bili_cli.auth._validate_credential") as mock_validate, \
-         patch("bili_cli.auth._extract_browser_credential") as mock_extract:
+         patch("bili_cli.auth._validate_credential") as mock_validate:
         cred = get_credential(mode="optional")
         assert cred is saved
         mock_validate.assert_not_called()
-        mock_extract.assert_not_called()
 
 
 def test_get_credential_write_rejects_missing_bili_jct():
     saved = Credential(sessdata="saved", bili_jct="")
     with patch("bili_cli.auth._load_saved_credential", return_value=saved), \
-         patch("bili_cli.auth._extract_browser_credential", return_value=None), \
          patch("bili_cli.auth._validate_credential", return_value=False):
         cred = get_credential(mode="write")
         assert cred is None
-
-
-def test_extract_browser_credential_timeout_returns_none():
-    with patch("bili_cli.auth.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="x", timeout=1)):
-        assert _extract_browser_credential() is None
-
-
-def test_extract_browser_credential_bad_json_returns_none():
-    fake = SimpleNamespace(returncode=0, stdout="not-json", stderr="")
-    with patch("bili_cli.auth.subprocess.run", return_value=fake):
-        assert _extract_browser_credential() is None
-
-
-def test_extract_browser_credential_empty_output_returns_none():
-    fake = SimpleNamespace(returncode=0, stdout="   ", stderr="")
-    with patch("bili_cli.auth.subprocess.run", return_value=fake):
-        assert _extract_browser_credential() is None
 
 
 def test_render_compact_qr_returns_multiline_text():
@@ -220,44 +171,69 @@ def test_supports_unicode_half_blocks_with_non_unicode_encoding():
         assert _supports_unicode_half_blocks() is False
 
 
-def test_get_qr_terminal_output_falls_back_when_private_qr_link_missing():
-    class DummyLogin:
-        def get_qrcode_terminal(self):
-            return "DEFAULT_QR"
-
-    assert _get_qr_terminal_output(DummyLogin()) == "DEFAULT_QR"
-
-
-def test_get_qr_terminal_output_falls_back_when_unicode_not_supported():
-    class DummyLogin:
-        _QrCodeLogin__qr_link = "https://example.com"
-
-        def get_qrcode_terminal(self):
-            return "DEFAULT_QR"
-
-    with patch("bili_cli.auth._supports_unicode_half_blocks", return_value=False):
-        assert _get_qr_terminal_output(DummyLogin()) == "DEFAULT_QR"
+def test_get_credential_returns_none_without_saved_file():
+    with patch("bili_cli.auth._load_saved_credential", return_value=None), \
+         patch("bili_cli.auth._validate_credential") as mock_validate:
+        assert get_credential() is None
+        mock_validate.assert_not_called()
 
 
-def test_get_qr_terminal_output_falls_back_when_compact_render_returns_none():
-    class DummyLogin:
-        _QrCodeLogin__qr_link = "https://example.com"
+def test_get_credential_clears_expired_saved():
+    saved = Credential(sessdata="saved", bili_jct="jct")
+    with patch("bili_cli.auth._load_saved_credential", return_value=saved), \
+         patch("bili_cli.auth._validate_credential", return_value=False), \
+         patch("bili_cli.auth.clear_credential") as mock_clear:
+        assert get_credential() is None
+        mock_clear.assert_called_once()
 
-        def get_qrcode_terminal(self):
-            return "DEFAULT_QR"
 
+def test_auth_never_touches_browser_cookies():
+    import bili_cli.auth as auth
+
+    assert not hasattr(auth, "_extract_browser_credential")
+    assert "browser_cookie3" not in pathlib.Path(auth.__file__).read_text().replace("browser-cookie3", "")
+
+
+def test_credential_from_login_prefers_set_cookie_headers():
+    cred = _credential_from_login(
+        {"SESSDATA": "hdr%2Csess", "bili_jct": "jct", "DedeUserID": "42", "buvid3": "b3"},
+        "https://passport.biligame.com/x/passport-login/web/crossDomain?SESSDATA=old&bili_jct=old",
+        "refresh",
+    )
+    assert cred.sessdata == "hdr%2Csess"
+    assert cred.bili_jct == "jct"
+    assert cred.dedeuserid == "42"
+    assert cred.ac_time_value == "refresh"
+    assert cred.buvid3 == "b3"
+
+
+def test_credential_from_login_falls_back_to_url_query():
+    cred = _credential_from_login(
+        {},
+        "https://passport.biligame.com/x/passport-login/web/crossDomain?DedeUserID=7&SESSDATA=abc&bili_jct=xyz",
+        "",
+    )
+    assert (cred.sessdata, cred.bili_jct, cred.dedeuserid) == ("abc", "xyz", "7")
+
+
+def test_credential_from_login_empty_when_nothing_returned():
+    assert _credential_from_login({}, "", "").sessdata == ""
+
+
+def test_get_qr_terminal_output_ascii_when_unicode_not_supported():
+    with patch("bili_cli.auth._supports_unicode_half_blocks", return_value=False), \
+         patch("bili_cli.auth._render_ascii_qr", return_value="ASCII_QR"):
+        assert _get_qr_terminal_output("https://example.com") == "ASCII_QR"
+
+
+def test_get_qr_terminal_output_ascii_when_compact_render_returns_none():
     with patch("bili_cli.auth._supports_unicode_half_blocks", return_value=True), \
-         patch("bili_cli.auth._render_compact_qr", return_value=None):
-        assert _get_qr_terminal_output(DummyLogin()) == "DEFAULT_QR"
+         patch("bili_cli.auth._render_compact_qr", return_value=None), \
+         patch("bili_cli.auth._render_ascii_qr", return_value="ASCII_QR"):
+        assert _get_qr_terminal_output("https://example.com") == "ASCII_QR"
 
 
 def test_get_qr_terminal_output_prefers_compact_rendering_when_available():
-    class DummyLogin:
-        _QrCodeLogin__qr_link = "https://example.com"
-
-        def get_qrcode_terminal(self):
-            return "DEFAULT_QR"
-
     with patch("bili_cli.auth._supports_unicode_half_blocks", return_value=True), \
          patch("bili_cli.auth._render_compact_qr", return_value="COMPACT_QR"):
-        assert _get_qr_terminal_output(DummyLogin()) == "COMPACT_QR"
+        assert _get_qr_terminal_output("https://example.com") == "COMPACT_QR"
