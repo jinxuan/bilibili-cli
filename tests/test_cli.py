@@ -8,6 +8,7 @@ import yaml
 from click.testing import CliRunner
 
 from bili_cli.cli import cli
+from bili_cli.exceptions import RateLimitError
 
 
 @pytest.fixture
@@ -465,6 +466,28 @@ def test_user_videos_json(runner):
         assert data[0]["bvid"] == "BV1new"
 
 
+def test_user_videos_passes_optional_credential_and_publish_date(runner):
+    cred = MagicMock()
+    videos = [{"bvid": "BV1new", "title": "New Video", "play": 123, "length": "01:23", "created": 1700000000}]
+    with patch("bili_cli.commands.common.get_credential", return_value=cred) as mock_get_cred, \
+         patch("bili_cli.client.get_user_videos", new_callable=AsyncMock, return_value=videos) as mock_videos:
+        result = runner.invoke(cli, ["user-videos", "946974", "--json"])
+        assert result.exit_code == 0
+        mock_get_cred.assert_called_with(mode="optional")
+        assert mock_videos.call_args.kwargs["credential"] is cred
+        data = json.loads(result.output)["data"]
+        assert data[0]["published_at"] == 1700000000
+        assert data[0]["published_date"]
+
+
+def test_user_videos_rate_limited_error_code(runner):
+    with patch("bili_cli.commands.common.get_credential", return_value=None), \
+         patch("bili_cli.client.get_user_videos", new_callable=AsyncMock, side_effect=RateLimitError("HTTP 412")):
+        result = runner.invoke(cli, ["user-videos", "946974", "--yaml"])
+        assert result.exit_code != 0
+        assert "rate_limited" in result.output
+
+
 def test_user_videos_invalid_max(runner):
     result = runner.invoke(cli, ["user-videos", "946974", "--max", "0"])
     assert result.exit_code != 0
@@ -480,7 +503,8 @@ def test_user_videos_api_error_returns_nonzero(runner):
 
 def test_user_videos_handles_invalid_length_field(runner):
     videos = [{"bvid": "BV1new", "title": "New Video", "play": 123, "length": "abc"}]
-    with patch("bili_cli.client.get_user_videos", new_callable=AsyncMock, return_value=videos):
+    with patch("bili_cli.commands.common.get_credential", return_value=None), \
+         patch("bili_cli.client.get_user_videos", new_callable=AsyncMock, return_value=videos):
         result = runner.invoke(cli, ["user-videos", "946974"])
         assert result.exit_code == 0
         assert "00:00" in result.output

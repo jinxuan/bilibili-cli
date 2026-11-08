@@ -68,9 +68,11 @@ def user(uid_or_name: str, as_json: bool, as_yaml: bool):
 
     uid = _resolve_uid(uid_or_name)
 
-    info = common.run_or_exit(client.get_user_info(uid, credential=None), "获取用户信息失败")
+    # Logged-in cookies make space APIs far less likely to hit 412 risk control.
+    cred = common.get_credential(mode="optional")
+    info = common.run_or_exit(client.get_user_info(uid, credential=cred), "获取用户信息失败")
     relation = common.run_or_exit(
-        client.get_user_relation_info(uid, credential=None),
+        client.get_user_relation_info(uid, credential=cred),
         "获取用户信息失败",
     )
 
@@ -114,7 +116,7 @@ def user_videos(uid_or_name: str, count: int, as_json: bool, as_yaml: bool):
     uid = _resolve_uid(uid_or_name)
 
     videos = common.run_or_exit(
-        client.get_user_videos(uid, count=count, credential=None),
+        client.get_user_videos(uid, count=count, credential=common.get_credential(mode="optional")),
         "获取视频列表失败",
     )
 
