@@ -41,6 +41,9 @@ _USER_AGENT = (
 
 _BVID_RE = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
 
+_RATE_LIMIT_CODES = {-412, 412, -352, -429, 429}
+_RATE_LIMIT_HTTP_STATUS = {412, 429}
+
 
 def extract_bvid(url_or_bvid: str) -> str:
     """Extract BV ID from a Bilibili URL or return as-is if already a BV ID."""
@@ -66,10 +69,14 @@ def _map_api_error(action: str, exc: Exception) -> BiliError:
         # Not found
         if code in {-404, 62002, 62004}:
             return NotFoundError(f"{action}: {exc}")
-        # Rate limit / anti-scraping
-        if code in {-412, 412}:
-            return RateLimitError(f"{action}: {exc}")
+        # Rate limit / anti-scraping (-352: risk-control verification)
+        if code in _RATE_LIMIT_CODES:
+            return RateLimitError(f"{action}: [{code}] {getattr(exc, 'msg', '') or '请求被风控拦截'}")
         return BiliError(f"{action}: [{code}] {exc}")
+
+    # HTTP-level anti-scraping: 412 / 429 come back as an HTML error page
+    if isinstance(exc, NetworkException) and getattr(exc, "status", None) in _RATE_LIMIT_HTTP_STATUS:
+        return RateLimitError(f"{action}: HTTP {exc.status}，触发 B站风控/限流，请稍后重试或登录后再试")
 
     if isinstance(exc, (NetworkException, ResponseException, aiohttp.ClientError, asyncio.TimeoutError)):
         return NetworkError(f"{action}: {exc}")

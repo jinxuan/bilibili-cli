@@ -3,10 +3,10 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from bilibili_api.exceptions import CredentialNoSessdataException, NetworkException
+from bilibili_api.exceptions import CredentialNoSessdataException, NetworkException, ResponseCodeException
 
 from bili_cli import client
-from bili_cli.exceptions import AuthenticationError, BiliError, InvalidBvidError, NetworkError
+from bili_cli.exceptions import AuthenticationError, BiliError, InvalidBvidError, NetworkError, RateLimitError
 
 
 @pytest.mark.asyncio
@@ -17,6 +17,21 @@ async def test_get_video_info(mock_video_info):
         assert result["title"] == "测试视频标题"
         assert result["stat"]["view"] == 15000
         MockVideo.assert_called_once_with(bvid="BV1test123", credential=None)
+
+
+@pytest.mark.parametrize("status", [412, 429])
+def test_map_api_error_http_rate_limit_strips_html(status):
+    exc = NetworkException(status, "<!DOCTYPE html><html>...</html>")
+    err = client._map_api_error("获取用户视频列表", exc)
+    assert isinstance(err, RateLimitError)
+    assert "<html" not in str(err)
+    assert str(status) in str(err)
+
+
+@pytest.mark.parametrize("code", [-412, -352])
+def test_map_api_error_risk_control_codes(code):
+    err = client._map_api_error("获取视频信息", ResponseCodeException(code, "风控校验失败"))
+    assert isinstance(err, RateLimitError)
 
 
 @pytest.mark.asyncio

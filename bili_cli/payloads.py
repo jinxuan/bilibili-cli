@@ -21,6 +21,12 @@ def _to_int(value: object, default: int = 0) -> int:
     return default
 
 
+def _format_date(timestamp: int) -> str:
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+
 def _format_duration(seconds: object) -> str:
     total = max(_to_int(seconds, 0), 0)
     if total >= 3600:
@@ -66,6 +72,8 @@ def normalize_video_summary(video: dict[str, Any]) -> dict[str, Any]:
     owner = video.get("owner", {}) if isinstance(video.get("owner"), dict) else {}
     stat = video.get("stat", {}) if isinstance(video.get("stat"), dict) else {}
     duration_seconds = _to_int(video.get("duration"), _to_int(video.get("length"), 0))
+    # video detail uses `pubdate`; space video lists use `created`
+    published_at = _to_int(video.get("pubdate"), _to_int(video.get("created"), 0))
     url = ""
     if isinstance(video.get("bvid"), str) and video.get("bvid"):
         url = f"https://www.bilibili.com/video/{video['bvid']}"
@@ -78,6 +86,8 @@ def normalize_video_summary(video: dict[str, Any]) -> dict[str, Any]:
         "description": video.get("desc", "") or video.get("description", ""),
         "duration_seconds": duration_seconds,
         "duration": _format_duration(duration_seconds),
+        "published_at": published_at,
+        "published_date": _format_date(published_at),
         "url": url,
         "owner": {
             "id": str(owner.get("mid", owner.get("id", ""))),
